@@ -1,0 +1,403 @@
+import os
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+# farmwars_onefile.py
+# Python 3.11+
+# pip install aiogram==3.* fastapi uvicorn
+
+import asyncio
+import time
+import random
+import sqlite3
+from typing import Optional
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+import uvicorn
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import WebAppInfo
+
+# ======================
+# CONFIG
+# ======================
+HOST = "0.0.0.0"
+PORT = 8000
+
+# ВАЖЛИВО:
+# Mini App відкривається по URL. Якщо ти локально — Telegram не відкриє localhost.
+# Потрібен публічний https домен (наприклад: ngrok / cloudflared / свій VPS).
+PUBLIC_WEBAPP_URL = "https://YOUR-DOMAIN.COM/"  # сюди вставиш свій https URL
+
+DB_PATH = "farmwars.db"
+
+MAX_OFFLINE_HOURS = 8
+PVP_DAILY_LIMIT_FREE = 5
+PVP_DAILY_LIMIT_PREMIUM = 10  # заготовка
+BOOST_X2_SECONDS = 24 * 3600  # 24h
+
+# Економіка
+def income_per_hour(farm_level: int, workers: int, boost_active: bool) -> int:
+    base = farm_level * workers * 10
+    return base * (2 if boost_active else 1)
+
+def cost_farm_level(level: int) -> int:
+    return level * 100
+
+def cost_workers(workers: int) -> int:
+    return workers * 150
+
+def power(farm_level: int, workers: int) -> int:
+    return farm_level * 20 + workers * 10 + random.randint(1, 50)
+
+# ======================
+# DB
+# ======================
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+cur = db.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    farm_level INTEGER DEFAULT 1,
+    workers INTEGER DEFAULT 1,
+    coins INTEGER DEFAULT 0,
+    last_claim INTEGER DEFAULT 0,
+    pvp_wins INTEGER DEFAULT 0,
+    pvp_today INTEGER DEFAULT 0,
+    pvp_day INTEGER DEFAULT 0,
+    boost_until INTEGER DEFAULT 0,
+    is_premium INTEGER DEFAULT 0
+)
+""")
+db.commit()
+
+def now_ts() -> int:
+    return int(time.time())
+
+def today_key() -> int:
+    # простий "день" по UTC (для MVP)
+    return int(time.time() // 86400)
+
+def ensure_user(user_id: int):
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if cur.fetchone() is None:
+        cur.execute("""
+            INSERT INTO users (user_id, farm_level, workers, coins, last_claim, pvp_wins, pvp_today, pvp_day, boost_until, is_premium)
+            VALUES (?, 1, 1, 0, ?, 0, 0, ?, 0, 0)
+        """, (user_id, now_ts(), today_key()))
+        db.commit()
+
+def get_user(user_id: int) -> sqlite3.Row:
+    ensure_user(user_id)
+    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    return cur.fetchone()
+
+def reset_daily_pvp_if_needed(user_id: int):
+    u = get_user(user_id)
+    tk = today_key()
+    if u["pvp_day"] != tk:
+        cur.execute("UPDATE users SET pvp_today=0, pvp_day=? WHERE user_id=?", (tk, user_id))
+        db.commit()
+
+def is_boost_active(u: sqlite3.Row) -> bool:
+    return u["boost_until"] > now_ts()
+
+# ======================
+# FASTAPI (Backend + MiniApp)
+# ======================
+app = FastAPI(title="FarmWars OneFile")
+
+HTML_PAGE = """
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Farm Wars</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body{font-family:Arial, sans-serif; margin:0; padding:16px; background:#0b0f14; color:#e9eef5;}
+    .card{background:#121a24; border:1px solid #1e2a3a; border-radius:16px; padding:14px; margin:12px 0;}
+    .row{display:flex; gap:10px; flex-wrap:wrap;}
+    button{border:0; border-radius:12px; padding:12px 14px; font-weight:700; cursor:pointer;}
+    .btn{background:#2a66ff; color:white;}
+    .btn2{background:#1f2b3d; color:#e9eef5; border:1px solid #2c3f59;}
+    .small{opacity:.8; font-size:13px; line-height:1.35;}
+    .title{font-size:22px; font-weight:900;}
+    .stat{font-size:16px; margin-top:8px;}
+    code{background:#0b0f14; padding:2px 6px; border-radius:8px; border:1px solid #1e2a3a;}
+  </style>
+</head>
+<body>
+  <div class="title">🌱 Farm Wars: Idle PvP</div>
+  <div class="small">Забирай офлайн-дохід, прокачуй ферму, бийся в PvP. (MVP)</div>
+
+  <div class="card">
+    <div class="stat" id="uinfo">Завантаження...</div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn" onclick="claim()">💰 Claim</button>
+      <button class="btn2" onclick="pvp()">⚔️ PvP</button>
+      <button class="btn2" onclick="refresh()">🔄 Refresh</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:900;">⬆️ Upgrades</div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn2" onclick="upgrade('farm')">🌾 Farm Level</button>
+      <button class="btn2" onclick="upgrade('workers')">👷 Workers</button>
+    </div>
+    <div class="small" id="costs" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:900;">ℹ️ Notes</div>
+    <div class="small">
+      Для Telegram Mini App потрібен <b>https</b> URL. Локально <code>localhost</code> в Telegram не відкриється.
+    </div>
+  </div>
+
+<script>
+  const tg = window.Telegram.WebApp;
+  tg.expand();
+
+  const user = tg.initDataUnsafe && tg.initDataUnsafe.user;
+  const uid = user ? user.id : 0;
+
+  function api(path, body={}) {
+    return fetch(path, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ user_id: uid, ...body })
+    }).then(r => r.json());
+  }
+
+  function render(state){
+    const boost = state.boost_active ? "✅ x2" : "❌";
+    document.getElementById("uinfo").innerHTML =
+      `👤 <b>${state.user_id}</b><br>` +
+      `💰 Coins: <b>${state.coins}</b><br>` +
+      `🌾 Farm: <b>${state.farm_level}</b> | 👷 Workers: <b>${state.workers}</b><br>` +
+      `⚔️ PvP wins: <b>${state.pvp_wins}</b> | Today: <b>${state.pvp_today}/${state.pvp_limit}</b><br>` +
+      `🚀 Boost x2: <b>${boost}</b>`;
+    document.getElementById("costs").innerHTML =
+      `Ціна Farm Level: <b>${state.cost_farm}</b> coins<br>` +
+      `Ціна Workers: <b>${state.cost_workers}</b> coins`;
+  }
+
+  function refresh(){
+    api("/api/state").then(render);
+  }
+
+  function claim(){
+    api("/api/claim").then(res=>{
+      tg.showPopup({title:"Claim", message:`Заробив: ${res.earned} coins`, buttons:[{type:"ok"}]});
+      refresh();
+    });
+  }
+
+  function upgrade(kind){
+    api("/api/upgrade", { kind }).then(res=>{
+      if(!res.ok){
+        tg.showPopup({title:"Upgrade", message:res.error, buttons:[{type:"ok"}]});
+      } else {
+        tg.showPopup({title:"Upgrade", message:`Успіх! -${res.spent} coins`, buttons:[{type:"ok"}]});
+      }
+      refresh();
+    });
+  }
+
+  function pvp(){
+    api("/api/pvp").then(res=>{
+      tg.showPopup({title:"PvP", message:res.message, buttons:[{type:"ok"}]});
+      refresh();
+    });
+  }
+
+  // auto start
+  api("/api/start").then(()=>refresh());
+</script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTML_PAGE
+
+@app.post("/api/start")
+def api_start(payload: dict):
+    user_id = int(payload.get("user_id", 0))
+    if user_id <= 0:
+        return JSONResponse({"ok": False, "error": "No Telegram user. Open via Telegram Mini App."})
+    ensure_user(user_id)
+    return {"ok": True}
+
+@app.post("/api/state")
+def api_state(payload: dict):
+    user_id = int(payload.get("user_id", 0))
+    if user_id <= 0:
+        return JSONResponse({"ok": False, "error": "No user_id"}, status_code=400)
+
+    reset_daily_pvp_if_needed(user_id)
+    u = get_user(user_id)
+
+    pvp_limit = PVP_DAILY_LIMIT_PREMIUM if u["is_premium"] else PVP_DAILY_LIMIT_FREE
+
+    return {
+        "ok": True,
+        "user_id": u["user_id"],
+        "farm_level": u["farm_level"],
+        "workers": u["workers"],
+        "coins": u["coins"],
+        "pvp_wins": u["pvp_wins"],
+        "pvp_today": u["pvp_today"],
+        "pvp_limit": pvp_limit,
+        "boost_active": is_boost_active(u),
+        "cost_farm": cost_farm_level(u["farm_level"] + 1),
+        "cost_workers": cost_workers(u["workers"] + 1),
+    }
+
+@app.post("/api/claim")
+def api_claim(payload: dict):
+    user_id = int(payload.get("user_id", 0))
+    if user_id <= 0:
+        return JSONResponse({"ok": False, "error": "No user_id"}, status_code=400)
+
+    u = get_user(user_id)
+    last = u["last_claim"] or now_ts()
+    now = now_ts()
+
+    hours = (now - last) // 3600
+    hours = max(0, min(hours, MAX_OFFLINE_HOURS))
+
+    earned = hours * income_per_hour(u["farm_level"], u["workers"], is_boost_active(u))
+
+    cur.execute(
+        "UPDATE users SET coins = coins + ?, last_claim = ? WHERE user_id = ?",
+        (earned, now, user_id)
+    )
+    db.commit()
+
+    return {"ok": True, "earned": int(earned)}
+
+@app.post("/api/upgrade")
+def api_upgrade(payload: dict):
+    user_id = int(payload.get("user_id", 0))
+    kind = payload.get("kind")
+    if user_id <= 0:
+        return JSONResponse({"ok": False, "error": "No user_id"}, status_code=400)
+
+    u = get_user(user_id)
+
+    if kind == "farm":
+        new_level = u["farm_level"] + 1
+        price = cost_farm_level(new_level)
+        if u["coins"] < price:
+            return {"ok": False, "error": f"Не вистачає coins. Треба {price}."}
+        cur.execute("UPDATE users SET coins=coins-?, farm_level=? WHERE user_id=?", (price, new_level, user_id))
+        db.commit()
+        return {"ok": True, "spent": price}
+
+    if kind == "workers":
+        new_workers = u["workers"] + 1
+        price = cost_workers(new_workers)
+        if u["coins"] < price:
+            return {"ok": False, "error": f"Не вистачає coins. Треба {price}."}
+        cur.execute("UPDATE users SET coins=coins-?, workers=? WHERE user_id=?", (price, new_workers, user_id))
+        db.commit()
+        return {"ok": True, "spent": price}
+
+    return {"ok": False, "error": "Unknown upgrade kind"}
+
+@app.post("/api/pvp")
+def api_pvp(payload: dict):
+    user_id = int(payload.get("user_id", 0))
+    if user_id <= 0:
+        return JSONResponse({"ok": False, "error": "No user_id"}, status_code=400)
+
+    reset_daily_pvp_if_needed(user_id)
+    me = get_user(user_id)
+
+    pvp_limit = PVP_DAILY_LIMIT_PREMIUM if me["is_premium"] else PVP_DAILY_LIMIT_FREE
+    if me["pvp_today"] >= pvp_limit:
+        return {"ok": False, "message": f"Ліміт PvP на сьогодні: {pvp_limit}. Прийди завтра 🙂"}
+
+    # беремо випадкового суперника
+    cur.execute("""
+        SELECT user_id, farm_level, workers
+        FROM users
+        WHERE user_id != ?
+        ORDER BY RANDOM()
+        LIMIT 1
+    """, (user_id,))
+    enemy = cur.fetchone()
+
+    if enemy is None:
+        # якщо в БД один гравець
+        enemy_power = random.randint(1, 60)
+        enemy_name = "Bot"
+    else:
+        enemy_power = power(enemy["farm_level"], enemy["workers"])
+        enemy_name = str(enemy["user_id"])
+
+    my_power = power(me["farm_level"], me["workers"])
+
+    # +1 PvP today
+    cur.execute("UPDATE users SET pvp_today = pvp_today + 1 WHERE user_id=?", (user_id,))
+    db.commit()
+
+    if my_power > enemy_power:
+        reward = 100
+        cur.execute("UPDATE users SET coins = coins + ?, pvp_wins = pvp_wins + 1 WHERE user_id=?", (reward, user_id))
+        db.commit()
+        return {"ok": True, "message": f"✅ WIN vs {enemy_name}! Power {my_power} > {enemy_power}. +{reward} coins"}
+    else:
+        return {"ok": True, "message": f"❌ LOSE vs {enemy_name}. Power {my_power} <= {enemy_power}. Спробуй ще!"}
+
+# ======================
+# BOT (aiogram 3)
+# ======================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎮 Open Farm Wars", web_app=WebAppInfo(url=PUBLIC_WEBAPP_URL))
+    kb.button(text="ℹ️ Help", callback_data="help")
+    await message.answer(
+        "🌱 Farm Wars: Idle PvP\n\n"
+        "Натисни кнопку нижче, щоб відкрити міні-апу 👇",
+        reply_markup=kb.as_markup()
+    )
+
+@dp.callback_query(F.data == "help")
+async def cb_help(call):
+    await call.message.answer(
+        "Що треба:\n"
+        "1) Запусти цей файл на VPS/хостингу\n"
+        "2) Зроби https URL (ngrok/cloudflared/домен)\n"
+        "3) Встав PUBLIC_WEBAPP_URL\n"
+        "4) /start у боті → Open Farm Wars"
+    )
+    await call.answer()
+
+async def run_bot():
+    await dp.start_polling(bot)
+
+async def run_api():
+    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+async def main():
+    # одночасно бот + api
+    await asyncio.gather(run_api(), run_bot())
+
+if __name__ == "__main__":
+    asyncio.run(main())
